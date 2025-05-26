@@ -1,0 +1,326 @@
+---
+- name: Setup Nagios monitoring
+  hosts: monitoring_servers
+  become: yes
+  tasks:
+    - name: Install Nagios and dependencies
+      apt:
+        name:
+          - nagios4
+          - nagios-plugins
+          - nagios-plugins-contrib
+          - apache2
+          - php
+          - libapache2-mod-php
+        state: present
+        update_cache: yes
+
+    - name: Fix Nagios Apache configuration before enabling modules
+      block:
+        - name: Check if nagios4-cgi.conf exists
+          stat:
+            path: /etc/apache2/conf-enabled/nagios4-cgi.conf
+          register: nagios_cgi_conf
+
+        - name: Temporarily disable problematic Nagios configuration
+          command: a2disconf nagios4-cgi
+          when: nagios_cgi_conf.stat.exists
+          ignore_errors: yes
+
+        - name: Reload Apache to clear syntax errors
+          systemd:
+            name: apache2
+            state: reloaded
+          ignore_errors: yes
+
+    - name: Enable required Apache modules
+      apache2_module:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - rewrite
+        - cgi
+        - auth_digest
+      notify: restart apache2
+
+    - name: Find Nagios CGI configuration file
+      find:
+        paths:
+          - /etc/apache2/conf-available
+          - /etc/apache2/conf-enabled
+          - /etc/nagios4/conf.d
+          - /etc/nagios4
+        patterns:
+          - "*nagios*cgi*"
+          - "nagios4-cgi.conf"
+          - "nagios.conf"
+        recurse: yes
+      register: nagios_config_files
+
+    - name: Display found Nagios config files
+      debug:
+        var: nagios_config_files.files
+
+    - name: Fix Nagios CGI configuration file
+      block:
+        - name: Configure Nagios CGI authentication (change to Basic auth)
+          replace:
+            path: "{{ item.path }}"
+            regexp: 'AuthType\s+Digest'
+            replace: 'AuthType Basic'
+            backup: yes
+          loop: "{{ nagios_config_files.files }}"
+          when:
+            - nagios_config_files.files is defined
+            - nagios_config_files.files | length > 0
+          ignore_errors: yes
+
+        - name: Remove AuthDigestDomain directive
+          lineinfile:
+            path: "{{ item.path }}"
+            regexp: '^\s*AuthDigestDomain.*'
+            state: absent
+          loop: "{{ nagios_config_files.files }}"
+          when:
+            - nagios_config_files.files is defined
+            - nagios_config_files.files | length > 0
+          ignore_errors: yes
+
+        - name: Re-enable Nagios CGI configuration
+          command: a2enconf nagios4-cgi
+          ignore_errors: yes
+          notify: restart apache2
+
+    - name: Install required Python library for htpasswd
+      apt:
+        name: python3-passlib
+        state: present
+
+    - name: Create nagios web user
+      htpasswd:
+        path: /etc/nagios4/htpasswd.users
+        name: nagiosadmin
+        password: nagios123
+        crypt_scheme: md5_crypt
+
+    - name: Set proper permissions on htpasswd file
+      file:
+        path: /etc/nagios4/htpasswd.users
+        owner: www-data
+        group: www-data
+        mode: '0644'
+
+    - name: Ensure Nagios configuration is valid
+      command: nagios4 -v /etc/nagios4/nagios.cfg
+      register: nagios_config_check
+      changed_when: false
+      failed_when: nagios_config_check.rc != 0
+
+    - name: Test Apache configuration before starting
+      command: apache2ctl configtest
+      register: apache_config_test
+      failed_when: false
+      changed_when: false
+
+    - name: Display Apache configuration test results
+      debug:
+        var: apache_config_test
+
+    - name: Fix Apache configuration issues
+      block:
+        - name: Stop Apache service
+          systemd:
+            name: apache2
+            state: stopped
+          ignore_errors: yes
+
+        - name: Disable all Nagios configurations temporarily
+          shell: |
+            a2disconf nagios4-cgi 2>/dev/null || true
+            a2disconf nagios4-simple 2>/dev/null || true
+            a2disconf nagios4 2>/dev/null || true
+          ignore_errors: yes
+
+        - name: Test Apache configuration after disabling configs
+          command: apache2ctl configtest
+          register: apache_test_clean
+          failed_when: false
+          changed_when: false
+
+        - name: Start Apache with clean configuration
+          systemd:
+            name: apache2
+            state: started
+          when: apache_test_clean.rc == 0
+
+        - name: Create Nagios directories if they don't exist
+          file:
+            path: "{{ item }}"
+            state: directory
+            owner: www-data
+            group: www-data
+            mode: '0755'
+          loop:
+            - /usr/share/nagios4/htdocs
+            - /usr/lib/cgi-bin/nagios4
+            - /etc/nagios4
+          ignore_errors: yes
+
+        - name: Create simple working Nagios Apache configuration
+          copy:
+            content: |
+              # Simple Nagios4 Apache Configuration
+              ScriptAlias /nagios4/cgi-bin /usr/lib/cgi-bin/nagios4
+
+              <Directory "/usr/lib/cgi-bin/nagios4">
+                 Options ExecCGI
+                 AllowOverride None
+                 Order allow,deny
+                 Allow from all
+                 AuthType Basic
+                 AuthName "Nagios Access"
+                 AuthUserFile /etc/nagios4/htpasswd.users
+                 Require valid-user
+              </Directory>
+
+              Alias /nagios4 /usr/share/nagios4/htdocs
+
+              <Directory "/usr/share/nagios4/htdocs">
+                 Options None
+                 AllowOverride None
+                 Order allow,deny
+                 Allow from all
+                 AuthType Basic
+                 AuthName "Nagios Access"
+                 AuthUserFile /etc/nagios4/htpasswd.users
+                 Require valid-user
+              </Directory>
+            dest: /etc/apache2/conf-available/nagios4-working.conf
+            backup: yes
+
+        - name: Enable the working Nagios configuration
+          command: a2enconf nagios4-working
+          notify: restart apache2
+
+        - name: Test Apache configuration with Nagios config
+          command: apache2ctl configtest
+          register: apache_test_nagios
+          failed_when: false
+          changed_when: false
+
+        - name: Display final configuration test
+          debug:
+            msg: "Apache config test result: {{ apache_test_nagios.stdout_lines }}"
+
+    - name: Start and enable services carefully
+      block:
+        - name: Start Apache service
+          systemd:
+            name: apache2
+            state: started
+            enabled: yes
+          register: apache_start_result
+          ignore_errors: yes
+
+        - name: Check Apache service status
+          command: systemctl status apache2
+          register: apache_status
+          failed_when: false
+          changed_when: false
+
+        - name: Display Apache status
+          debug:
+            var: apache_status.stdout_lines
+
+        - name: Start Nagios service
+          systemd:
+            name: nagios4
+            state: started
+            enabled: yes
+          register: nagios_start_result
+          ignore_errors: yes
+
+        - name: Check Nagios service status
+          command: systemctl status nagios4
+          register: nagios_status
+          failed_when: false
+          changed_when: false
+
+        - name: Display Nagios status
+          debug:
+            var: nagios_status.stdout_lines
+
+    - name: Display Nagios web interface information
+      debug:
+        msg: |
+          Nagios web interface should be available at:
+          http://{{ ansible_default_ipv4.address }}/nagios4
+          Username: nagiosadmin
+          Password: nagios123
+
+  handlers:
+    - name: restart apache2
+      systemd:
+        name: apache2
+        state: restarted
+
+- name: Configure monitoring templates for managed hosts
+  hosts: app_servers,db_servers,web_servers
+  become: yes
+  tasks:
+    - name: Install NRPE plugin
+      apt:
+        name:
+          - nagios-nrpe-server
+          - nagios-plugins
+          - nagios-plugins-basic
+          - nagios-plugins-standard
+        state: present
+        update_cache: yes
+
+    - name: Configure NRPE allowed hosts
+      lineinfile:
+        path: /etc/nagios/nrpe.cfg
+        regexp: '^allowed_hosts='
+        line: 'allowed_hosts=127.0.0.1,{{ hostvars[groups["monitoring_servers"][0]]["ansible_default_ipv4"]["address"] }}'
+        backup: yes
+      notify: restart nrpe
+
+    - name: Configure NRPE server address
+      lineinfile:
+        path: /etc/nagios/nrpe.cfg
+        regexp: '^server_address='
+        line: 'server_address={{ ansible_default_ipv4.address }}'
+        backup: yes
+      notify: restart nrpe
+
+    - name: Enable additional NRPE commands
+      blockinfile:
+        path: /etc/nagios/nrpe.cfg
+        block: |
+          # Custom commands
+          command[check_load]=/usr/lib/nagios/plugins/check_load -w 15,10,5 -c 30,25,20
+          command[check_disk_root]=/usr/lib/nagios/plugins/check_disk -w 20% -c 10% -p /
+          command[check_memory]=/usr/lib/nagios/plugins/check_memory -w 80 -c 90
+          command[check_swap]=/usr/lib/nagios/plugins/check_swap -w 20% -c 10%
+        marker: "# {mark} ANSIBLE MANAGED CUSTOM COMMANDS"
+      notify: restart nrpe
+
+    - name: Start and enable NRPE
+      systemd:
+        name: nagios-nrpe-server
+        state: started
+        enabled: yes
+
+    - name: Test NRPE connectivity
+      command: /usr/lib/nagios/plugins/check_nrpe -H 127.0.0.1
+      register: nrpe_test
+      changed_when: false
+      failed_when: false
+
+
+  handlers:
+    - name: restart nrpe
+      systemd:
+        name: nagios-nrpe-server
+        state: restarted
