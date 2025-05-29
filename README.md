@@ -465,7 +465,7 @@ rate(your_counter_metric_name[5m])
 # For better visualization, you might also use:
 increase(your_counter_metric_name[1h])
 
-# Example for HTTP requests:
+# Example for HTTP requests: 
 rate(http_requests_total[5m])
 ```
 [![Product Name prom-1][prom-1]](https://example.com)
